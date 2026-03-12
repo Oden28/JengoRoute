@@ -1,0 +1,6 @@
+# Railway Procfile - defines processes for deployment
+# web: FastAPI server
+# worker: Redis RQ worker for async message processing
+web: uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+worker: python worker.py
+
