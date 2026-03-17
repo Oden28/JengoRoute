@@ -92,16 +92,19 @@ Optimize for operational correctness, reliability, and clear architecture.
 
 Quick start
 
-1. Database — Run backend/db/schema.sql in Supabase SQL Editor
+1. Database — Run backend/db/schema.sql and backend/db/migrations/001_scheduler_log.sql in Supabase SQL Editor
 
 #backend
 ```bash
 cd backend
 cp .env.example .env        # Fill in real values
+python3 venv-jengo/bin/activate
+source venv-jengo/bin/activate
 pip install -r requirements.txt
 docker-compose up -d redis   # Start Redis
 uvicorn main:app --reload    # Start API server
 python worker.py             # Start queue worker (separate terminal)
+python scheduler_runner.py   # Shift templates (shift_start, missed_checkin, patrol_prompt, shift_end)
 ```
 
 #frontend

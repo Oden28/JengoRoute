@@ -24,6 +24,7 @@ WhatsApp Cloud API webhook payload structure:
 }
 """
 
+import json
 import logging
 from typing import Any, Dict
 
@@ -81,8 +82,24 @@ async def receive_message(request: Request):
         logger.error("Failed to parse webhook body")
         return Response(status_code=200)  # Always return 200 to prevent retries
 
+    # Log full webhook payload every time (so you can see object, number, metadata, etc.)
+    logger.info("=== WhatsApp webhook payload ===\n%s", json.dumps(body, indent=2, default=str))
+
     # Parse the WhatsApp webhook payload
     messages = _extract_messages(body)
+    if messages:
+        for m in messages:
+            logger.info(
+                "Incoming message: type=%s body=%s from=%s",
+                m.get("message_type"),
+                repr(m.get("body")),
+                m.get("phone"),
+            )
+        logger.info("=== Parsed messages (enqueueing) ===\n%s", json.dumps(messages, indent=2, default=str))
+    else:
+        statuses = _extract_statuses(body)
+        if statuses:
+            logger.info("Webhook: status update(s) %s (no message to process)", [s.get("status") for s in statuses])
 
     for msg_data in messages:
         try:
@@ -104,6 +121,19 @@ async def receive_message(request: Request):
 
     # Always return 200 to WhatsApp — we've queued the job
     return Response(status_code=200)
+
+
+def _extract_statuses(body: Dict[str, Any]) -> list:
+    """Extract status updates (sent, delivered, read) from webhook payload. No value.messages."""
+    statuses = []
+    try:
+        for entry in body.get("entry", []):
+            for change in entry.get("changes", []):
+                for s in change.get("value", {}).get("statuses", []):
+                    statuses.append(s)
+    except Exception:
+        pass
+    return statuses
 
 
 def _extract_messages(body: Dict[str, Any]) -> list:
@@ -207,6 +237,23 @@ def _parse_single_message(
         parsed["media_id"] = doc.get("id")
         parsed["media_mime_type"] = doc.get("mime_type", "application/pdf")
         parsed["body"] = doc.get("caption", "")
+
+    # --- Button (template quick reply) ---
+    elif msg_type == "button":
+        parsed["message_type"] = "button"
+        button = msg.get("button", {})
+        parsed["body"] = (button.get("text") or button.get("payload") or "").strip()
+
+    # --- Interactive (e.g. button_reply from template or interactive message) ---
+    elif msg_type == "interactive":
+        interactive = msg.get("interactive", {})
+        if interactive.get("type") == "button_reply":
+            parsed["message_type"] = "button"
+            br = interactive.get("button_reply", {})
+            parsed["body"] = (br.get("title") or br.get("id") or "").strip()
+        else:
+            parsed["message_type"] = "unknown"
+            logger.warning(f"Unsupported interactive type: {interactive.get('type')}")
 
     else:
         # Unsupported message type — still store it

@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     verification_radius_meters: float = 200.0  # Max distance for location verification
     checkin_time_tolerance_minutes: int = 30    # Tolerance window for check-in times
 
+    # --- Shift scheduler (UTC) ---
+    shift_start_utc_hour: int = 6           # e.g. 6 = 06:00 UTC
+    shift_start_utc_minute: int = 0
+    shift_end_utc_hour: int = 14            # e.g. 14 = 14:00 UTC (8hr shift)
+    shift_end_utc_minute: int = 0
+    missed_checkin_delay_minutes: int = 15   # Send missed_checkin if no checkin by this many mins after shift_start
+    patrol_prompt_offset_minutes: int = 240 # Send patrol_prompt this many mins into shift (e.g. 4hr)
+    scheduler_interval_seconds: int = 300   # How often scheduler runs (default 5 min)
+
     @property
     def whatsapp_api_base(self) -> str:
         """Base URL for WhatsApp Cloud API."""

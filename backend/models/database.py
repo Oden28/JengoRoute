@@ -23,3 +23,13 @@ def get_supabase_client() -> Client:
 # Singleton client instance for reuse
 supabase: Client = get_supabase_client()
 
+
+def reinit_supabase_for_fork() -> None:
+    """
+    Create a fresh Supabase client. Call this at the start of each RQ job.
+    After fork(), the parent's HTTP connections are unsafe in the child;
+    using a new client avoids exit 1 / connection errors in the worker.
+    """
+    global supabase
+    supabase = get_supabase_client()
+

@@ -14,11 +14,13 @@ preventing webhook timeouts and enabling scalable async processing.
 
 import logging
 from typing import Dict, Any, Optional, List
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from uuid import uuid4
 
 from models.database import supabase
 from services.event_engine import event_engine
 from services.media_service import media_service
+from services.notification_service import notification_service
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,58 @@ async def process_whatsapp_message(message_data: Dict[str, Any]):
         # Step 2: Store raw message in database (audit trail)
         message_record = await _store_raw_message(message_data, user)
 
+        # Step 2b: Handle template-button driven flows before creating events
+        body = (message_data.get("body") or "").strip().lower()
+        if msg_type == "button" and body in ("share location", "share location.", "quick reply"):
+            from services.whatsapp_client import whatsapp_client
+            await whatsapp_client.send_location_request(to=phone)
+            _store_flow_marker(
+                user_id=user["id"],
+                phone=phone,
+                marker="awaiting_location",
+            )
+            supabase.table("messages").update({"processed": True}).eq("id", message_record["id"]).execute()
+            logger.info(f"Sent location request to {phone} (Share Location button)")
+            return
+        if msg_type == "button" and body in (
+            "report incident",
+            "report incidents",
+            "report incident.",
+            "report incidents.",
+        ):
+            from services.whatsapp_client import whatsapp_client
+            # Start guided incident collection flow instead of creating empty incident event.
+            await whatsapp_client.send_guard_template(
+                to=phone,
+                template_name="incident_start",
+                language_code="en_US",
+                body_parameters=None,
+            )
+            _store_flow_marker(
+                user_id=user["id"],
+                phone=phone,
+                marker="awaiting_incident_details",
+            )
+            supabase.table("messages").update({"processed": True}).eq("id", message_record["id"]).execute()
+            logger.info(f"Started incident flow for {phone} (Report Incident button)")
+            return
+
+        # Normalize template button labels into canonical event phrases.
+        # This keeps template UX flexible while event detection stays deterministic.
+        normalized_text = _normalize_guard_button_to_text(msg_type=msg_type, body=body)
+        if normalized_text:
+            message_data["body"] = normalized_text
+            body = normalized_text
+
+        # Context-aware coercion:
+        # If guard sends free text while we're waiting for incident details,
+        # treat it as incident narrative instead of defaulting to check-in.
+        if msg_type == "text" and _is_freeform_text(body):
+            pending_marker = _get_latest_open_marker(phone=phone, marker_prefix="awaiting_incident_details")
+            if pending_marker:
+                message_data["body"] = f"incident {message_data.get('body', '').strip()}"
+                logger.info("Applied incident context for %s based on recent flow marker", phone)
+
         # Step 3: Process media attachments (if any)
         media_urls = []
         if message_data.get("media_id"):
@@ -72,6 +126,28 @@ async def process_whatsapp_message(message_data: Dict[str, Any]):
                     {"media_url": url}
                 ).eq("id", message_record["id"]).execute()
 
+        # Context-aware location handling:
+        # If this is a location message and there is an open unverified check-in/patrol,
+        # attach location to that event instead of creating a new duplicate event.
+        if msg_type == "location":
+            updated_event = await _attach_location_to_open_event(
+                user=user,
+                latitude=message_data.get("latitude"),
+                longitude=message_data.get("longitude"),
+            )
+            if updated_event:
+                from services.whatsapp_client import whatsapp_client
+                await whatsapp_client.send_location_thanks(to=phone)
+                supabase.table("messages").update(
+                    {"processed": True}
+                ).eq("id", message_record["id"]).execute()
+                logger.info(
+                    "Location message linked to existing event %s (%s)",
+                    updated_event.get("id"),
+                    updated_event.get("event_type"),
+                )
+                return
+
         # Step 4: Send to Event Engine for detection + verification
         event = await event_engine.process_event(
             user=user,
@@ -80,6 +156,27 @@ async def process_whatsapp_message(message_data: Dict[str, Any]):
             longitude=message_data.get("longitude"),
             media_urls=media_urls,
         )
+
+        # Save lightweight conversation-state markers for follow-up flows.
+        if event.get("event_type") in ("checkin", "patrol") and (
+            message_data.get("latitude") is None or message_data.get("longitude") is None
+        ):
+            _store_flow_marker(
+                user_id=user["id"],
+                phone=phone,
+                marker=f"awaiting_location:{event.get('id')}",
+            )
+        if event.get("event_type") == "incident":
+            _store_flow_marker(
+                user_id=user["id"],
+                phone=phone,
+                marker="incident_recorded",
+            )
+
+        # Confirm location capture with a lightweight template message.
+        if msg_type == "location":
+            from services.whatsapp_client import whatsapp_client
+            await whatsapp_client.send_location_thanks(to=phone)
 
         # Step 5: Mark message as processed
         supabase.table("messages").update(
@@ -174,4 +271,174 @@ async def _send_unknown_user_response(phone: str):
             "• Share your 📍 location for verification"
         ),
     )
+
+
+def _normalize_guard_button_to_text(msg_type: str, body: str) -> Optional[str]:
+    """Map known template button labels to canonical text used by the event engine."""
+    if msg_type != "button":
+        return None
+
+    button_map = {
+        # missed_checkin
+        "check-in now": "checkin",
+        "off duty": "checkout off duty",
+        # patrol_prompt
+        "patrol complete": "patrol complete",
+        "patrol incomplete": "incident patrol incomplete",
+        # incident_start
+        "armed / weapon": "incident armed / weapon",
+        "break-in": "incident break-in",
+        "suspicious person": "incident suspicious person",
+        # shift_start
+        "start shift": "checkin shift start",
+        "cannot start": "incident cannot start shift",
+        # shift_end
+        "end shift": "checkout end shift",
+        "handover": "checkout handover",
+        "overtime": "checkout overtime",
+    }
+    return button_map.get(body)
+
+
+def _is_freeform_text(text: str) -> bool:
+    """True when text doesn't already look like a command keyword."""
+    if not text:
+        return False
+    t = text.strip().lower()
+    known_prefixes = (
+        "checkin", "check in", "check-in",
+        "checkout", "check out", "check-out",
+        "incident", "patrol", "sos", "help", "alert",
+        "armed", "weapon", "break-in", "break in", "suspicious",
+    )
+    return not any(t.startswith(prefix) for prefix in known_prefixes)
+
+
+def _store_flow_marker(user_id: str, phone: str, marker: str) -> None:
+    """
+    Persist conversational flow state in messages table.
+    Keeps the system stateless in memory but stateful across process restarts.
+    """
+    supabase.table("messages").insert(
+        {
+            "whatsapp_message_id": f"flow-{uuid4()}",
+            "phone": phone,
+            "direction": "outgoing",
+            "message_type": "flow_marker",
+            "body": marker,
+            "user_id": user_id,
+            "processed": True,
+        }
+    ).execute()
+
+
+def _get_latest_open_marker(phone: str, marker_prefix: str, within_minutes: int = 120) -> Optional[Dict[str, Any]]:
+    """Read the latest recent flow marker for a phone number."""
+    since = (datetime.now(timezone.utc) - timedelta(minutes=within_minutes)).isoformat()
+    result = (
+        supabase.table("messages")
+        .select("*")
+        .eq("phone", phone)
+        .eq("direction", "outgoing")
+        .eq("message_type", "flow_marker")
+        .gte("created_at", since)
+        .order("created_at", desc=True)
+        .limit(30)
+        .execute()
+    )
+    terminal_markers = {
+        "awaiting_incident_details": ("incident_recorded",),
+    }
+    for row in (result.data or []):
+        marker = (row.get("body") or "").strip().lower()
+        blockers = terminal_markers.get(marker_prefix, ())
+        if marker in blockers:
+            return None
+        if marker.startswith(marker_prefix):
+            return row
+    return None
+
+
+async def _attach_location_to_open_event(
+    user: Dict[str, Any],
+    latitude: Optional[float],
+    longitude: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    """Attach location to the most recent unverified checkin/patrol for this guard."""
+    if latitude is None or longitude is None:
+        return None
+
+    recent = (
+        supabase.table("events")
+        .select("*")
+        .eq("user_id", user["id"])
+        .in_("event_type", ["checkin", "patrol"])
+        .gte("created_at", (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat())
+        .order("created_at", desc=True)
+        .limit(10)
+        .execute()
+    )
+    target = None
+    for ev in (recent.data or []):
+        if ev.get("verification_status") != "verified":
+            target = ev
+            break
+    if not target:
+        return None
+
+    loc_verified, loc_note = event_engine.verify_location(
+        latitude,
+        longitude,
+        user.get("expected_latitude"),
+        user.get("expected_longitude"),
+    )
+    created_at = target.get("created_at")
+    event_time = None
+    if isinstance(created_at, str):
+        # Handles "Z" and offset formats
+        event_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    time_verified, time_note = event_engine.verify_time(event_time=event_time)
+    verification_status = "verified" if (loc_verified and time_verified) else "unverified"
+    verification_notes = f"{loc_note} | {time_note} | {target.get('verification_notes', '')}"
+
+    updated = (
+        supabase.table("events")
+        .update(
+            {
+                "latitude": latitude,
+                "longitude": longitude,
+                "verification_status": verification_status,
+                "verification_notes": verification_notes,
+                "location_verified": loc_verified,
+                "time_verified": time_verified,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("id", target["id"])
+        .execute()
+    )
+    event = updated.data[0] if updated.data else None
+    if not event:
+        return None
+
+    # Send updated verification response and supervisor escalation if still unverified.
+    from services.whatsapp_client import whatsapp_client
+
+    await whatsapp_client.send_verification_result(
+        to=user["phone"],
+        event_type=event.get("event_type", "checkin"),
+        verified=(verification_status == "verified"),
+        notes=verification_notes,
+    )
+    if verification_status == "unverified":
+        await notification_service.notify_supervisors(
+            company_id=user["company_id"],
+            guard_name=user["name"],
+            event_type=event.get("event_type", "checkin"),
+            description=event.get("description", ""),
+            latitude=event.get("latitude"),
+            longitude=event.get("longitude"),
+        )
+
+    return event
 

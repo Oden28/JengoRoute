@@ -49,15 +49,25 @@ class EventEngine:
 
         text_lower = text.strip().lower()
 
-        # Check-in detection
-        if text_lower in ("checkin", "check in", "check-in", "arrived", "on post", "here"):
+        # Check-in detection (including welcome_guard/shift_start buttons)
+        if text_lower in (
+            "checkin", "check in", "check-in", "checkin.", "arrived", "on post", "here",
+        ):
             return EventType.CHECKIN, None
 
-        # Check-out detection
+        if text_lower.startswith("checkin"):
+            suffix = text_lower.replace("checkin", "", 1).strip(" -")
+            return EventType.CHECKIN, suffix or None
+
+        # Check-out detection (including shift_end/missed_checkin buttons)
         if text_lower in ("checkout", "check out", "check-out", "leaving", "off post", "done"):
             return EventType.CHECKOUT, None
+        if re.match(r"^(?:checkout|check out|check-out|off duty|end shift|handover|overtime)\b", text_lower):
+            return EventType.CHECKOUT, text
 
         # Patrol detection — extract sector if present
+        if text_lower in ("patrol complete", "patrol incomplete"):
+            return EventType.PATROL, text
         patrol_match = re.match(
             r"(?:patrol|patrolled|patrol done|patrolling)\s*(?:sector\s*)?(.+)?",
             text_lower,
@@ -66,14 +76,16 @@ class EventEngine:
             sector = patrol_match.group(1)
             return EventType.PATROL, sector.strip() if sector else None
 
-        # Incident detection — rest of text is description
+        # Incident detection (including welcome_guard button "Report Incident(s)")
+        if text_lower in ("report incident", "report incidents", "report incident.", "report incidents."):
+            return EventType.INCIDENT, "Reported via welcome button"
         incident_match = re.match(
-            r"(?:incident|emergency|alert|sos|help|suspicious|breach|intrusion)\s*(.*)",
+            r"(?:incident|emergency|alert|sos|help|suspicious|breach|intrusion|armed|weapon|break-?in)\s*(.*)",
             text_lower,
         )
         if incident_match:
             description = incident_match.group(1)
-            return EventType.INCIDENT, description.strip() if description else None
+            return EventType.INCIDENT, description.strip() if description else "Reported via button"
 
         # Default: treat as check-in with description
         return EventType.CHECKIN, text
@@ -203,9 +215,11 @@ class EventEngine:
         photo_verified, photo_note = self.verify_photo(media_urls)
 
         # Determine overall verification status
-        # Checkins require location; incidents always flagged for review
+        # Check-ins and patrols require location; incidents are pending review.
         if event_type == EventType.INCIDENT:
             verification_status = VerificationStatus.PENDING
+        elif event_type == EventType.CHECKOUT:
+            verification_status = VerificationStatus.VERIFIED if time_verified else VerificationStatus.UNVERIFIED
         elif loc_verified and time_verified:
             verification_status = VerificationStatus.VERIFIED
         else:
@@ -241,8 +255,8 @@ class EventEngine:
         # Step 5: Trigger notifications
         await self._handle_notifications(event, user, event_type, verification_status)
 
-        # Step 6: If location missing, request it from guard
-        if latitude is None and longitude is None:
+        # Step 6: If location is missing for location-sensitive events, request it
+        if event_type in (EventType.CHECKIN, EventType.PATROL) and latitude is None and longitude is None:
             await self._request_location(user)
 
         # Update user's last_seen
@@ -262,13 +276,14 @@ class EventEngine:
         media_urls: Optional[List[str]],
     ):
         """Create an incident record linked to the event."""
+        severity = self._derive_incident_severity(description)
         incident_data = {
             "event_id": event["id"],
             "user_id": user["id"],
             "company_id": user["company_id"],
             "title": f"Incident reported by {user['name']}",
             "description": description,
-            "severity": "medium",  # Default; can be refined later
+            "severity": severity,
             "status": "open",
             "latitude": latitude,
             "longitude": longitude,
@@ -318,6 +333,17 @@ class EventEngine:
         """Request location from guard if not provided."""
         from services.whatsapp_client import whatsapp_client
         await whatsapp_client.send_location_request(to=user["phone"])
+
+    def _derive_incident_severity(self, description: str) -> str:
+        """Simple keyword severity mapping for incident_start button categories."""
+        text = (description or "").lower()
+        critical_keywords = ("armed", "weapon", "attack", "fire", "gun", "shoot")
+        high_keywords = ("break-in", "break in", "forced entry", "intrusion", "breach")
+        if any(k in text for k in critical_keywords):
+            return "critical"
+        if any(k in text for k in high_keywords):
+            return "high"
+        return "medium"
 
 
 # Singleton instance

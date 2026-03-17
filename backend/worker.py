@@ -14,14 +14,22 @@ Note: For async function support, we use a custom worker loop
 that runs the async functions in an event loop.
 """
 
+# Avoid macOS fork crash when RQ spawns job workers (ObjC must be set before process starts)
+import os
+import sys
+if sys.platform == "darwin" and os.environ.get("OBJC_DISABLE_INITIALIZE_FORK_SAFETY") != "YES":
+    os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+    os.execve(sys.executable, [sys.executable] + sys.argv, os.environ)
+
 import asyncio
 import logging
-import sys
+import traceback
 
 from redis import Redis
 from rq import Worker, Queue, Connection
 
 from config import settings
+from models.database import reinit_supabase_for_fork
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -41,22 +49,43 @@ class AsyncWorker(Worker):
 
     def perform_job(self, job, queue):
         """Override to handle async job functions."""
-        # Get the actual function
+        # Fresh DB client in the forked child (parent's connections are unsafe after fork)
+        reinit_supabase_for_fork()
+
         func = job.func
 
         if asyncio.iscoroutinefunction(func):
-            # Run async function in event loop
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                job.func = lambda *args, **kwargs: loop.run_until_complete(
-                    func(*args, **kwargs)
+                # RQ's job.func is read-only; wrap execution via job.perform instead
+                def run_async_perform():
+                    return loop.run_until_complete(
+                        func(*job.args, **job.kwargs)
+                    )
+                original_perform = job.perform
+                job.perform = run_async_perform
+                try:
+                    return super().perform_job(job, queue)
+                finally:
+                    job.perform = original_perform
+            except Exception as e:
+                logger.error(
+                    "Job %s failed: %s\n%s",
+                    job.id, e, traceback.format_exc(),
                 )
-                return super().perform_job(job, queue)
+                raise
             finally:
                 loop.close()
         else:
-            return super().perform_job(job, queue)
+            try:
+                return super().perform_job(job, queue)
+            except Exception as e:
+                logger.error(
+                    "Job %s failed: %s\n%s",
+                    job.id, e, traceback.format_exc(),
+                )
+                raise
 
 
 def main():

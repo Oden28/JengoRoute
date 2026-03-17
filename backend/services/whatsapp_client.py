@@ -9,9 +9,10 @@ Handles all outgoing communication with the WhatsApp Cloud API:
 All guards interact via WhatsApp only; this is the outbound pipe.
 """
 
+import json
 import httpx
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from config import settings
 
@@ -55,11 +56,75 @@ class WhatsAppClient:
         }
         return await self._send_request(payload)
 
+    async def send_template_message(
+        self,
+        to: str,
+        template_name: str,
+        language_code: str = "en_US",
+        body_parameters: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Send a pre-approved WhatsApp template (e.g. welcome_guard).
+        Use for first contact or when the user hasn't messaged in 24+ hours.
+
+        Args:
+            to: Recipient phone number (E.164, e.g. 27659410613)
+            template_name: Template name as created in Meta (e.g. welcome_guard)
+            language_code: Template language (e.g. en_US)
+            body_parameters: Optional list of strings for {{1}}, {{2}}, ... in template body
+
+        Returns:
+            WhatsApp API response dict
+        """
+        template: Dict[str, Any] = {
+            "name": template_name,
+            "language": {"code": language_code},
+        }
+        if body_parameters:
+            # Official format: body parameters are ordered for {{1}}, {{2}}, ... (type + text only; no parameter_name when sending)
+            template["components"] = [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": str(p)} for p in body_parameters],
+                }
+            ]
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to.strip().replace("+", "").replace(" ", ""),
+            "type": "template",
+            "template": template,
+        }
+        return await self._send_request(payload)
+
+    async def send_guard_template(
+        self,
+        to: str,
+        template_name: str,
+        language_code: str = "en_US",
+        body_parameters: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Small semantic wrapper for guard-facing templates."""
+        return await self.send_template_message(
+            to=to,
+            template_name=template_name,
+            language_code=language_code,
+            body_parameters=body_parameters,
+        )
+
     async def send_location_request(self, to: str) -> Dict[str, Any]:
         """
-        Send a message asking the guard to share their location.
-        Used when a check-in is missing geolocation data.
+         Ask the guard to share their location.
+        Prefer the `location_request` template and fall back to text if unavailable.
         """
+        template_resp = await self.send_guard_template(
+            to=to,
+            template_name="location_request",
+            language_code="en_US",
+            body_parameters=None,
+        )
+        if not template_resp.get("error"):
+            return template_resp
         body = (
             "📍 *Location Required*\n\n"
             "Your check-in needs location verification. "
@@ -69,6 +134,24 @@ class WhatsAppClient:
             "3. Send your current location"
         )
         return await self.send_text_message(to, body)
+    
+    async def send_location_thanks(self, to: str) -> Dict[str, Any]:
+        """
+        Thank a guard after they share location.
+        Prefer `location_thanks` template and fall back to simple text.
+        """
+        template_resp = await self.send_guard_template(
+            to=to,
+            template_name="location_thanks",
+            language_code="en_US",
+            body_parameters=None,
+        )
+        if not template_resp.get("error"):
+            return template_resp
+        return await self.send_text_message(
+            to=to,
+            body="✅ Location received. Thank you.",
+        )
 
     async def send_verification_result(
         self, to: str, event_type: str, verified: bool, notes: str = ""
@@ -156,6 +239,11 @@ class WhatsAppClient:
         Send a request to the WhatsApp Cloud API.
         Handles errors and logging.
         """
+        # Log the outbound message (to, type, text/template) so you can see what we're sending
+        logger.info(
+            "=== WhatsApp outbound message ===\n%s",
+            json.dumps(payload, indent=2, default=str),
+        )
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -163,10 +251,18 @@ class WhatsAppClient:
                     json=payload,
                     headers=self.headers,
                 )
-                response.raise_for_status()
-                result = response.json()
-                logger.info(f"WhatsApp message sent: {result}")
-                return result
+                try:
+                    body = response.json()
+                except Exception:
+                    body = response.text or ""
+                if response.status_code >= 400:
+                    msg = body.get("error", body) if isinstance(body, dict) else body
+                    if isinstance(msg, dict):
+                        msg = msg.get("message", str(msg))
+                    logger.error("WhatsApp API error %s: %s", response.status_code, msg)
+                    return {"error": msg, "status_code": response.status_code}
+                logger.info("WhatsApp API response: %s", body)
+                return body
         except httpx.HTTPError as e:
             logger.error(f"WhatsApp API error: {e}")
             return {"error": str(e)}
