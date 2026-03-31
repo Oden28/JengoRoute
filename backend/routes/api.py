@@ -424,7 +424,7 @@ async def send_patrol_prompt(body: SendGuardTemplateBody = Body(...)):
 
     result = await whatsapp_client.send_guard_template(
         to=body.to,
-        template_name="patrol_prompt",
+        template_name="patro_prompt",
         language_code=body.language_code or "en_US",
         body_parameters=body.body_parameters,
     )

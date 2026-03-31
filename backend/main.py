@@ -71,6 +71,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",       # Local Next.js dev
+        "http://127.0.0.1:3000",      # Alternative local URL (same-origin differs from localhost)
         "https://*.vercel.app",        # Vercel deployments
     ],
     allow_credentials=True,

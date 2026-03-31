@@ -174,6 +174,18 @@ class WhatsAppClient:
         )
         return await self.send_text_message(to, body)
 
+    async def send_incident_confirmation(self, to: str) -> Dict[str, Any]:
+        """
+        Confirm to guard that their incident was received and supervisors notified.
+        Used when incident flow is complete (details + location captured).
+        """
+        body = (
+            "🚨 *Incident received*\n\n"
+            "Supervisors have been notified and will respond shortly. "
+            "Thank you for reporting."
+        )
+        return await self.send_text_message(to, body)
+
     async def send_alert_to_supervisor(
         self, to: str, guard_name: str, event_type: str, description: str,
         latitude: Optional[float] = None, longitude: Optional[float] = None

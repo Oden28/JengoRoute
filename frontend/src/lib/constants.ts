@@ -165,8 +165,8 @@ export const REFRESH = {
   activity: 8_000,    // Activity feed: 8s
 } as const;
 
-// ─── Default Map Center (Nairobi) ───────────────────────────────────────────
+// ─── Default Map Center (Cape Town CBD) ─────────────────────────────────────
 
-export const DEFAULT_MAP_CENTER: [number, number] = [-1.2921, 36.8219];
+export const DEFAULT_MAP_CENTER: [number, number] = [-33.9249, 18.4241];
 export const DEFAULT_MAP_ZOOM = 13;
 

@@ -15,6 +15,7 @@ Verification Layer:
 
 import re
 import logging
+from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict, Any
 from geopy.distance import geodesic
@@ -252,12 +253,27 @@ class EventEngine:
         if event_type == EventType.INCIDENT:
             await self._create_incident(event, user, description, latitude, longitude, media_urls)
 
-        # Step 5: Trigger notifications
-        await self._handle_notifications(event, user, event_type, verification_status)
-
-        # Step 6: If location is missing for location-sensitive events, request it
-        if event_type in (EventType.CHECKIN, EventType.PATROL) and latitude is None and longitude is None:
+        # Step 5: Request location when missing (check-in, patrol, incident)
+        # Guard gets location prompt right away for shift check-in or incident
+        if event_type in (EventType.CHECKIN, EventType.PATROL, EventType.INCIDENT) and latitude is None and longitude is None:
             await self._request_location(user)
+            if event_type == EventType.INCIDENT:
+                # Store marker so next location message gets linked to this incident
+                supabase.table("messages").insert(
+                    {
+                        "whatsapp_message_id": f"flow-{uuid4()}",
+                        "phone": user["phone"],
+                        "direction": "outgoing",
+                        "message_type": "flow_marker",
+                        "body": f"awaiting_incident_location:{event.get('id')}",
+                        "user_id": user["id"],
+                        "processed": True,
+                    }
+                ).execute()
+                logger.info("Incident flow: awaiting location for event %s", event.get("id"))
+
+        # Step 6: Trigger notifications (verification result to guard, supervisor alerts if needed)
+        await self._handle_notifications(event, user, event_type, verification_status)
 
         # Update user's last_seen
         supabase.table("users").update(
@@ -303,23 +319,43 @@ class EventEngine:
         Send notifications based on event type and verification status.
 
         Rules:
-        - Incidents → always notify supervisors
-        - Unverified events → notify supervisors
-        - All events → confirm to guard
+        - Incidents without location: request location first; defer supervisor notify until location received (except critical)
+        - Incidents with location: send confirmation, notify supervisors
+        - Critical incidents: notify immediately even without location
+        - Unverified check-in/patrol: notify supervisors
+        - Skip guard verification when we just sent location request (they get result when they share)
         """
-        # Notify guard about verification status
         from services.whatsapp_client import whatsapp_client
 
-        verified = verification_status == VerificationStatus.VERIFIED
-        await whatsapp_client.send_verification_result(
-            to=user["phone"],
-            event_type=event_type.value,
-            verified=verified,
-            notes=event.get("verification_notes", ""),
+        # Skip verification result to guard when we already sent location request
+        skip_guard_verification = (
+            event_type in (EventType.CHECKIN, EventType.PATROL, EventType.INCIDENT)
+            and event.get("latitude") is None
+            and event.get("longitude") is None
         )
+        if not skip_guard_verification:
+            if event_type == EventType.INCIDENT:
+                await whatsapp_client.send_incident_confirmation(to=user["phone"])
+            else:
+                verified = verification_status == VerificationStatus.VERIFIED
+                await whatsapp_client.send_verification_result(
+                    to=user["phone"],
+                    event_type=event_type.value,
+                    verified=verified,
+                    notes=event.get("verification_notes", ""),
+                )
 
-        # Notify supervisors for incidents or unverified events
-        if event_type == EventType.INCIDENT or verification_status == VerificationStatus.UNVERIFIED:
+        # Notify supervisors: incidents with location, critical incidents (even without location), unverified events
+        incident_has_location = event.get("latitude") is not None and event.get("longitude") is not None
+        incident_severity_critical = self._derive_incident_severity(event.get("description", "")) == "critical"
+
+        notify_supervisors = False
+        if event_type == EventType.INCIDENT:
+            notify_supervisors = incident_has_location or incident_severity_critical
+        elif verification_status == VerificationStatus.UNVERIFIED:
+            notify_supervisors = True
+
+        if notify_supervisors:
             await notification_service.notify_supervisors(
                 company_id=user["company_id"],
                 guard_name=user["name"],

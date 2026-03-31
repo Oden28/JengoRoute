@@ -126,10 +126,39 @@ async def process_whatsapp_message(message_data: Dict[str, Any]):
                     {"media_url": url}
                 ).eq("id", message_record["id"]).execute()
 
+        # Handle incident flow when awaiting location
+        if msg_type == "text":
+            pending = _get_latest_open_marker(phone=phone, marker_prefix="awaiting_incident_location")
+            if pending:
+                if _is_skip_location(body):
+                    await _complete_incident_without_location(user=user, phone=phone, marker_row=pending)
+                    supabase.table("messages").update({"processed": True}).eq("id", message_record["id"]).execute()
+                    logger.info("Incident completed without location (guard skipped) for %s", phone)
+                    return
+                # Non-skip text: remind them to share location or skip
+                from services.whatsapp_client import whatsapp_client
+                await whatsapp_client.send_text_message(
+                    to=phone,
+                    body="📍 Please share your location for the incident, or reply *skip* if you can't.",
+                )
+                supabase.table("messages").update({"processed": True}).eq("id", message_record["id"]).execute()
+                return
+
         # Context-aware location handling:
-        # If this is a location message and there is an open unverified check-in/patrol,
-        # attach location to that event instead of creating a new duplicate event.
+        # 1. If in incident flow awaiting location → attach to incident, notify supervisors, confirm
+        # 2. Else if open unverified check-in/patrol → attach to that event
         if msg_type == "location":
+            updated = await _attach_location_to_open_incident(
+                user=user,
+                phone=phone,
+                latitude=message_data.get("latitude"),
+                longitude=message_data.get("longitude"),
+            )
+            if updated:
+                supabase.table("messages").update({"processed": True}).eq("id", message_record["id"]).execute()
+                logger.info("Location linked to incident %s for %s", updated.get("incident_id"), phone)
+                return
+
             updated_event = await _attach_location_to_open_event(
                 user=user,
                 latitude=message_data.get("latitude"),
@@ -166,12 +195,7 @@ async def process_whatsapp_message(message_data: Dict[str, Any]):
                 phone=phone,
                 marker=f"awaiting_location:{event.get('id')}",
             )
-        if event.get("event_type") == "incident":
-            _store_flow_marker(
-                user_id=user["id"],
-                phone=phone,
-                marker="incident_recorded",
-            )
+        # Incident "incident_recorded" marker is stored when location is received or guard skips
 
         # Confirm location capture with a lightweight template message.
         if msg_type == "location":
@@ -300,6 +324,15 @@ def _normalize_guard_button_to_text(msg_type: str, body: str) -> Optional[str]:
     return button_map.get(body)
 
 
+def _is_skip_location(text: str) -> bool:
+    """True when guard indicates they cannot or will not share location."""
+    if not text:
+        return False
+    t = text.strip().lower()
+    skip_phrases = ("skip", "no", "cant", "can't", "cannot", "unable", "n/a", "na", "no location")
+    return t in skip_phrases or any(phrase in t for phrase in skip_phrases)
+
+
 def _is_freeform_text(text: str) -> bool:
     """True when text doesn't already look like a command keyword."""
     if not text:
@@ -348,6 +381,7 @@ def _get_latest_open_marker(phone: str, marker_prefix: str, within_minutes: int 
     )
     terminal_markers = {
         "awaiting_incident_details": ("incident_recorded",),
+        "awaiting_incident_location": ("incident_recorded",),
     }
     for row in (result.data or []):
         marker = (row.get("body") or "").strip().lower()
@@ -441,4 +475,116 @@ async def _attach_location_to_open_event(
         )
 
     return event
+
+
+async def _attach_location_to_open_incident(
+    user: Dict[str, Any],
+    phone: str,
+    latitude: Optional[float],
+    longitude: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    """
+    Attach location to an incident awaiting location (marker: awaiting_incident_location:{event_id}).
+    Updates event + incident, notifies supervisors, sends confirmation to guard.
+    """
+    if latitude is None or longitude is None:
+        return None
+
+    pending = _get_latest_open_marker(phone=phone, marker_prefix="awaiting_incident_location")
+    if not pending:
+        return None
+
+    marker_body = (pending.get("body") or "").strip()
+    if ":" not in marker_body:
+        return None
+    event_id = marker_body.split(":", 1)[1].strip()
+    if not event_id:
+        return None
+
+    # Update event with location
+    supabase.table("events").update(
+        {
+            "latitude": latitude,
+            "longitude": longitude,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ).eq("id", event_id).execute()
+
+    # Get incident by event_id and update it
+    incident_result = (
+        supabase.table("incidents")
+        .select("*")
+        .eq("event_id", event_id)
+        .limit(1)
+        .execute()
+    )
+    if not incident_result.data:
+        return None
+
+    incident = incident_result.data[0]
+    supabase.table("incidents").update(
+        {
+            "latitude": latitude,
+            "longitude": longitude,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ).eq("id", incident["id"]).execute()
+
+    # Notify supervisors (now we have full incident with location)
+    await notification_service.notify_supervisors(
+        company_id=user["company_id"],
+        guard_name=user["name"],
+        event_type="incident",
+        description=incident.get("description", ""),
+        latitude=latitude,
+        longitude=longitude,
+    )
+
+    from services.whatsapp_client import whatsapp_client
+    await whatsapp_client.send_incident_confirmation(to=phone)
+
+    _store_flow_marker(user_id=user["id"], phone=phone, marker="incident_recorded")
+
+    return {"event_id": event_id, "incident_id": incident["id"]}
+
+
+async def _complete_incident_without_location(
+    user: Dict[str, Any], phone: str, marker_row: Dict[str, Any]
+) -> None:
+    """
+    Complete incident flow when guard skips location (sends "skip", "no", etc.).
+    Notify supervisors with whatever we have; send confirmation to guard.
+    """
+    marker_body = (marker_row.get("body") or "").strip()
+    if ":" not in marker_body:
+        return
+    event_id = marker_body.split(":", 1)[1].strip()
+    if not event_id:
+        return
+
+    incident_result = (
+        supabase.table("incidents")
+        .select("*")
+        .eq("event_id", event_id)
+        .limit(1)
+        .execute()
+    )
+    if not incident_result.data:
+        return
+
+    incident = incident_result.data[0]
+
+    await notification_service.notify_supervisors(
+        company_id=user["company_id"],
+        guard_name=user["name"],
+        event_type="incident",
+        description=incident.get("description", ""),
+        latitude=None,
+        longitude=None,
+    )
+
+    from services.whatsapp_client import whatsapp_client
+    await whatsapp_client.send_incident_confirmation(to=phone)
+
+    _store_flow_marker(user_id=user["id"], phone=phone, marker="incident_recorded")
 

@@ -148,7 +148,7 @@ async def run_shift_scheduler_tick() -> Dict[str, int]:
         patrol_time = shift_start + timedelta(minutes=settings.patrol_prompt_offset_minutes)
         if now >= patrol_time:
             if not _already_sent_today(user_id, "patrol_prompt"):
-                if await _send_template_to_guard(guard, "patrol_prompt"):
+                if await _send_template_to_guard(guard, "patro_prompt"):
                     _log_sent(user_id, "patrol_prompt")
                     stats["patrol_prompt"] += 1
                     logger.info("Scheduler: sent patrol_prompt to %s", guard.get("name"))

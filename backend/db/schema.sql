@@ -143,37 +143,8 @@ ALTER TABLE incidents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 
 -- ============================================
--- SEED DATA (for testing)
+-- SEED DATA
+-- Run seed.sql separately after this schema file.
+-- See: backend/db/seed.sql
 -- ============================================
-INSERT INTO companies (id, name, phone, email, hq_latitude, hq_longitude)
-VALUES (
-    'a0000000-0000-0000-0000-000000000001',
-    'JengoRoute Security Demo',
-    '+254700000000',
-    'demo@jengoroute.com',
-    -1.2921,    -- Nairobi latitude
-    36.8219     -- Nairobi longitude
-) ON CONFLICT DO NOTHING;
-
-INSERT INTO users (id, phone, name, role, company_id, expected_latitude, expected_longitude)
-VALUES
-(
-    'b0000000-0000-0000-0000-000000000001',
-    '+254711111111',
-    'John Guard',
-    'guard',
-    'a0000000-0000-0000-0000-000000000001',
-    -1.2921,
-    36.8219
-),
-(
-    'b0000000-0000-0000-0000-000000000002',
-    '+254722222222',
-    'Jane Supervisor',
-    'supervisor',
-    'a0000000-0000-0000-0000-000000000001',
-    NULL,
-    NULL
-)
-ON CONFLICT DO NOTHING;
 

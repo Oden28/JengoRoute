@@ -9,10 +9,10 @@ redis==5.0.1
 rq==1.16.1
 
 # Supabase client (PostgreSQL + Storage)
-supabase==2.3.4
+supabase==2.16.0
 
-# HTTP client for WhatsApp Cloud API (must be <0.26 for supabase compatibility)
-httpx>=0.27.0
+# HTTP client for WhatsApp Cloud API & Supabase
+httpx==0.28.1
 
 # Data validation
 pydantic==2.7.4
